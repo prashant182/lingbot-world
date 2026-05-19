@@ -481,7 +481,16 @@ def sp_attn_forward_causal(
 
     current_end = current_start + seq_lens
     kv_cache_size = kv_cache["k"].shape[1]
-    if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+    if self.local_attn_size == -1:
+        # Fast path (no eviction possible — cache is global). Both indices
+        # advance identically every forward, so local_end_index ==
+        # current_end and local_start_index == current_start. Python ints
+        # via current_start (kwarg) + seq_lens_int — no .item() syncs.
+        local_end_index = current_start + seq_lens_int
+        local_start_index = current_start
+        kv_cache["k"][:, local_start_index:local_end_index] = key
+        kv_cache["v"][:, local_start_index:local_end_index] = v
+    elif (current_end > kv_cache["global_end_index"].item()) and (
             seq_lens + kv_cache["local_end_index"].item() > kv_cache_size):
         # Calculate the number of new tokens added in this step
         # Shift existing cache content left to discard oldest tokens
