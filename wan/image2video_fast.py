@@ -150,6 +150,11 @@ class WanI2VFast:
         # callers can clear via `pipe.clear_text_cache()` if needed.
         self._t5_cache: dict[str, list] = {}
 
+        # Reset per generate() and flipped True after the first DiT forward.
+        # Passed into model.forward as `cross_attn_first_call` to skip the
+        # crossattn_cache["is_init"].item() sync inside WanCrossAttention.
+        self._cross_attn_initialized: bool = False
+
     def clear_text_cache(self):
         """Drop all cached T5 prompt embeddings. Frees ~4 MB per entry."""
         self._t5_cache.clear()
@@ -279,6 +284,7 @@ class WanI2VFast:
                 crossattn_cache=warmup_cross_kv,
                 current_start=0,
                 max_attention_size=kv_size,
+                frame_seqlen=frame_seqlen,
             )
 
         if dist.is_initialized():
@@ -444,6 +450,10 @@ class WanI2VFast:
         max_seq_len = chunk_size * lat_h * lat_w // (
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
+        # Reset per-generate state: cross-attn K/V cache will be freshly
+        # initialized below; the first DiT forward must compute and store.
+        self._cross_attn_initialized = False
+
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
@@ -609,7 +619,8 @@ class WanI2VFast:
                     'kv_cache': self_kv_cache,
                     'crossattn_cache': cross_kv_cache,
                     'current_start': chunk_id * chunk_size * frame_seqlen,
-                    'max_attention_size': kv_size if max_attention_size is None else max_attention_size
+                    'max_attention_size': kv_size if max_attention_size is None else max_attention_size,
+                    'frame_seqlen': frame_seqlen,
                 }
 
                 if offload_model:
@@ -622,7 +633,10 @@ class WanI2VFast:
                     timestep = torch.stack(current_timestep).to(self.device)
 
                     noise_pred = self.model(
-                        x=latent_model_input, t=timestep, **kwargs)[0]
+                        x=latent_model_input, t=timestep,
+                        cross_attn_first_call=not self._cross_attn_initialized,
+                        **kwargs)[0]
+                    self._cross_attn_initialized = True
 
                     if offload_model:
                         torch.cuda.empty_cache()
@@ -646,7 +660,9 @@ class WanI2VFast:
                 # Update kv cache
                 context_timestep = [timesteps[-1] * 0.0]
                 timestep = torch.stack(context_timestep).to(self.device)
-                self.model(x=[x0], t=timestep, **kwargs)
+                self.model(x=[x0], t=timestep,
+                           cross_attn_first_call=False,
+                           **kwargs)
 
             pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
 
