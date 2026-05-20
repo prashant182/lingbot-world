@@ -286,7 +286,9 @@ def sp_dit_forward_causal(
     updates the KV cache, runs attention, then all-to-all back.
     """
 
-    assert len(x) == 1
+    # B>1 batched inference (E3 probe): assertion lifted. Downstream uses
+    # of seq_lens / grid_sizes assume homogeneous shape across batch.
+    # assert len(x) == 1
 
     if self.model_type == 'i2v':
         assert y is not None
@@ -320,7 +322,12 @@ def sp_dit_forward_causal(
 
     # time embeddings
     if t.dim() == 1:
-        t = t.expand(t.size(0), padded_seq_lens)
+        # E3: was `t.expand(t.size(0), padded_seq_lens)`, which only works
+        # when t is shape [1] (singleton expandable to anything). For B>1
+        # t is shape [B] and expand fails — add a unit dim first so the
+        # broadcast is [B, 1] → [B, padded_seq_lens]. Identical to the
+        # original at B=1.
+        t = t.unsqueeze(1).expand(t.size(0), padded_seq_lens)
     with torch.amp.autocast('cuda', dtype=torch.float32):
         bt = t.size(0)
         t = t.flatten()
@@ -350,8 +357,11 @@ def sp_dit_forward_causal(
                 c3=self.patch_size[2],
             ) for i in c2ws_plucker_emb
         ]
-        c2ws_plucker_emb = torch.cat(c2ws_plucker_emb,
-                                     dim=1)  # [1, (L1+...+Ln), C]
+        # E3: cat along batch dim. For B=1 (one element in the list) this
+        # is a no-op vs the original dim=1; for B>1 (multi-user) each user
+        # keeps its own camera conditioning instead of being merged into
+        # one batch=1 sequence.
+        c2ws_plucker_emb = torch.cat(c2ws_plucker_emb, dim=0)  # [B, L, C]
         c2ws_plucker_emb = self.patch_embedding_wancamctrl(c2ws_plucker_emb)
         c2ws_hidden_states = self.c2ws_hidden_states_layer2(
             torch_F.silu(self.c2ws_hidden_states_layer1(c2ws_plucker_emb)))
