@@ -384,61 +384,70 @@ class WanI2VFast:
                  max_sequence_length=512,
                  max_attention_size=None,):
         r"""
-        Generates video frames from input image and text prompt using diffusion process.
+        Generates video frames from one OR more user inputs in a single
+        batched chunk loop.
 
-        Args:
-            input_prompt (`str`):
-                Text prompt for content generation.
-            img (PIL.Image.Image):
-                Input image tensor. Shape: [3, H, W]
-            max_area (`int`, *optional*, defaults to 720*1280):
-                Maximum pixel area for latent space calculation. Controls video resolution scaling
-            frame_num (`int`, *optional*, defaults to 81):
-                How many frames to sample from a video. The number should be 4n+1
-            shift (`float`, *optional*, defaults to 5.0):
-                Noise schedule shift parameter. Affects temporal dynamics
-                [NOTE]: If you want to generate a 480p video, it is recommended to set the shift value to 3.0.
-            sample_solver (`str`, *optional*, defaults to 'unipc'):
-                Solver used to sample the video.
-            sampling_steps (`int`, *optional*, defaults to 40):
-                Number of diffusion sampling steps. Higher values improve quality but slow generation
-            seed (`int`, *optional*, defaults to -1):
-                Random seed for noise generation. If -1, use random seed
-            offload_model (`bool`, *optional*, defaults to True):
-                If True, offloads models to CPU during generation to save VRAM
+        Single-user (backward-compatible) — scalar inputs, scalar output:
+            video = pipe.generate("a prompt", pil_image, action_path="examples/03",
+                                  seed=42)
 
-        Returns:
-            torch.Tensor:
-                Generated video frames tensor. Dimensions: (C, N H, W) where:
-                - C: Color channels (3 for RGB)
-                - N: Number of frames (81)
-                - H: Frame height (from max_area)
-                - W: Frame width from max_area)
+        Multi-user (B>1) — list inputs, list output:
+            videos = pipe.generate(["prompt A", "prompt B"],
+                                   [img_A, img_B],
+                                   action_path=["examples/03", "examples/04"],
+                                   seed=[42, 123])
+            # videos[0] is user A's output, videos[1] is user B's.
+
+        Each per-user input may be passed as a scalar OR a list; scalars
+        broadcast across the batch. The shape derivation (lat_h, lat_w,
+        lat_f) is shared across the batch — homogeneous batching only.
+        Each user keeps its own seeded RNG so noise streams don't cross.
+
+        At batch_size=1, the RNG draw order matches the pre-refactor path
+        token-for-token → bit-identical output (gate-tested).
+
+        Returns
+        -------
+        torch.Tensor (rank-0, single-user input)
+            Video frames tensor, shape [C, N, H, W].
+        list[torch.Tensor] (rank-0, list inputs)
+            One video tensor per user, in input order.
+        None (other ranks)
         """
-
-        if input_prompt is not None and isinstance(input_prompt, str):
-            batch_size = 1
-        elif input_prompt is not None and isinstance(input_prompt, list):
-            batch_size = len(input_prompt)
+        # ── 0. Input normalization. Track whether the caller passed
+        # scalars so we can unpack the output the same way on return.
+        was_scalar_input = isinstance(input_prompt, str)
+        if was_scalar_input:
+            prompts = [input_prompt]
+            imgs = [img]
+            action_paths = [action_path]
+            seeds = [seed]
         else:
-            batch_size = 1
-        if action_path is not None:
-            c2ws = np.load(os.path.join(action_path, "poses.npy")) # opencv coordinate
-            len_c2ws = ((len(c2ws) - 1) // 4) * 4 + 1
-            frame_num = ((frame_num - 1) // 4) * 4 + 1
-            frame_num = min(frame_num, len_c2ws)
-            c2ws = c2ws[:frame_num]
-            if self.control_type == 'act':
-                # In 'act' mode, use rotation of c2ws to control orientation and wasd_action to drive movement.
-                wasd_action = np.load(os.path.join(action_path, "action.npy")) # wasd action
-                wasd_action = wasd_action[:frame_num]
+            prompts = list(input_prompt)
+            imgs = list(img) if isinstance(img, list) else [img] * len(prompts)
+            action_paths = (list(action_path) if isinstance(action_path, list)
+                            else [action_path] * len(prompts))
+            seeds = list(seed) if isinstance(seed, list) else [seed] * len(prompts)
+        batch_size = len(prompts)
+        assert len(imgs) == batch_size, \
+            f"img count {len(imgs)} != batch {batch_size}"
+        assert len(action_paths) == batch_size
+        assert len(seeds) == batch_size
 
-        # preprocess
-        img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
-
+        # ── 1. Shape derivation from user 0 (homogeneous batching: all
+        # users share H, W, F, chunk_size). Frame count is clamped by the
+        # shortest action path's poses.
         F = frame_num
-        h, w = img.shape[1:]
-        aspect_ratio = h / w
+        if action_paths[0] is not None:
+            c2ws_first = np.load(os.path.join(action_paths[0], "poses.npy"))
+            len_c2ws_first = ((len(c2ws_first) - 1) // 4) * 4 + 1
+            F = min(((F - 1) // 4) * 4 + 1, len_c2ws_first)
+
+        # All imgs are assumed same shape; preprocess user 0 to derive
+        # spatial dims, then re-use the derivation for all users.
+        img0_t = TF.to_tensor(imgs[0]).sub_(0.5).div_(0.5).to(self.device)
+        h0, w0 = img0_t.shape[1:]
+        aspect_ratio = h0 / w0
         lat_h = round(
             np.sqrt(max_area * aspect_ratio) // self.vae_stride[1] //
             self.patch_size[1] * self.patch_size[1])
@@ -453,180 +462,196 @@ class WanI2VFast:
         max_seq_len = chunk_size * lat_h * lat_w // (
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
+
         # Reset per-generate state: cross-attn K/V cache will be freshly
         # initialized below; the first DiT forward must compute and store.
         self._cross_attn_initialized = False
 
-        seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
-        seed_g = torch.Generator(device=self.device)
-        seed_g.manual_seed(seed)
-        noise = torch.randn(
-            16,
-            lat_f,
-            lat_h,
-            lat_w,
-            dtype=torch.float32,
-            generator=seed_g,
-            device=self.device)
+        # ── 2. Timesteps (shared across users; scheduler is stateless
+        # at inference). Mask is also shared (same F/lat_h/lat_w).
+        self.scheduler.set_timesteps(self.num_train_timesteps, shift=shift)
+        timesteps = self.scheduler.timesteps[timesteps_index]
 
         msk = torch.ones(1, F, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat([
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
-        ],
-                           dim=1)
+        ], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
         msk = msk.transpose(1, 2)[0]
 
-        # 2. Prepare timesteps
-        self.scheduler.set_timesteps(self.num_train_timesteps, shift=shift)
-        timesteps = self.scheduler.timesteps[timesteps_index]
+        # ── 3. Per-user preprocess. Each iteration replicates the single-
+        # user path exactly: seed → noise, prompt → T5 context, image →
+        # VAE-encoded y, action_path → c2ws_plucker_emb. At B=1, exactly
+        # one iteration runs and produces the same tensors as the
+        # pre-refactor code, in the same RNG order.
+        per_user_noise = []
+        per_user_context = []
+        per_user_y = []
+        per_user_c2ws = []
+        seed_gens = []  # kept alive across chunk loop for per-step add_noise.
 
-        # preprocess
-        # T5 cache: skip the encoder entirely if we've seen this exact prompt
-        # before in this pipe instance. Bit-identical: cached tensor is the
-        # same object returned by the prior call.
-        cache_key = hashlib.sha256(input_prompt.encode('utf-8')).hexdigest()
-        if cache_key in self._t5_cache:
-            context = self._t5_cache[cache_key]
-        else:
-            if not self.t5_cpu:
-                self.text_encoder.model.to(self.device)
-                context = self.text_encoder([input_prompt], self.device)
-                if offload_model:
-                    self.text_encoder.model.cpu()
+        for ui in range(batch_size):
+            # Seeded RNG per user.
+            user_seed = seeds[ui] if seeds[ui] >= 0 else random.randint(0, sys.maxsize)
+            sg = torch.Generator(device=self.device)
+            sg.manual_seed(user_seed)
+            seed_gens.append(sg)
+            per_user_noise.append(torch.randn(
+                16, lat_f, lat_h, lat_w,
+                dtype=torch.float32, generator=sg, device=self.device))
+
+            # T5 prompt encoding (uses the existing cache).
+            cache_key = hashlib.sha256(prompts[ui].encode('utf-8')).hexdigest()
+            if cache_key in self._t5_cache:
+                ctx_list = self._t5_cache[cache_key]
             else:
-                context = self.text_encoder([input_prompt], torch.device('cpu'))
-                context = [t.to(self.device) for t in context]
-            self._t5_cache[cache_key] = context
+                if not self.t5_cpu:
+                    self.text_encoder.model.to(self.device)
+                    ctx_list = self.text_encoder([prompts[ui]], self.device)
+                    if offload_model:
+                        self.text_encoder.model.cpu()
+                else:
+                    ctx_list = self.text_encoder([prompts[ui]], torch.device('cpu'))
+                    ctx_list = [t.to(self.device) for t in ctx_list]
+                self._t5_cache[cache_key] = ctx_list
+            per_user_context.append(ctx_list[0])
 
-        # cam preparation (only if action_path is provided)
-        dit_cond_dict = None
-        if action_path is not None:
-            Ks = torch.from_numpy(np.load(os.path.join(action_path, "intrinsics.npy"))).float()
+            # Image VAE encode.
+            img_t = (img0_t if ui == 0
+                     else TF.to_tensor(imgs[ui]).sub_(0.5).div_(0.5).to(self.device))
+            y_ui = self.vae.encode([
+                torch.concat([
+                    torch.nn.functional.interpolate(
+                        img_t[None].cpu(), size=(h, w),
+                        mode='bicubic').transpose(0, 1),
+                    torch.zeros(3, F - 1, h, w)
+                ], dim=1).to(self.device)
+            ])[0]
+            y_ui = torch.concat([msk, y_ui])
+            per_user_y.append(y_ui)
 
-            # The provided intrinsics are for original image size (480p). We need to transform them according to the new image size (h, w).
-            Ks = get_Ks_transformed(Ks,
-                                    height_org=480,
-                                    width_org=832,
-                                    height_resize=h,
-                                    width_resize=w,
-                                    height_final=h,
-                                    width_final=w)
-            Ks = Ks[0]
-
-            len_c2ws = len(c2ws)
-            len_c2ws_ = int((len_c2ws - 1) // 4) + 1
-            len_c2ws_ = int(len_c2ws_ - (len_c2ws_ % chunk_size))
-            c2ws_infer = interpolate_camera_poses(
-                src_indices=np.linspace(0, len_c2ws - 1, len_c2ws),
-                src_rot_mat=c2ws[:, :3, :3],
-                src_trans_vec=c2ws[:, :3, 3],
-                tgt_indices=np.linspace(0, len_c2ws - 1, len_c2ws_),
-            )
-            c2ws_infer = compute_relative_poses(c2ws_infer, framewise=True)
-            Ks = Ks.repeat(len(c2ws_infer), 1)
-
-            c2ws_infer = c2ws_infer.to(self.device)
-            Ks = Ks.to(self.device)
-            if self.control_type == 'act':
-                wasd_action = torch.from_numpy(wasd_action[::4]).float().to(self.device)
-            else:
-                wasd_action = None
-            only_rays_d = wasd_action is not None
-            c2ws_plucker_emb = get_plucker_embeddings(c2ws_infer, Ks, h, w, only_rays_d=only_rays_d)
-            c2ws_plucker_emb = rearrange(
-                c2ws_plucker_emb,
-                'f (h c1) (w c2) c -> (f h w) (c c1 c2)',
-                c1=int(h // lat_h),
-                c2=int(w // lat_w),
-            )
-            c2ws_plucker_emb = c2ws_plucker_emb[None, ...] # [b, f*h*w, c]
-            c2ws_plucker_emb = rearrange(c2ws_plucker_emb, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
-            if wasd_action is not None:
-                wasd_action_tensor = wasd_action[:, None, None, :].repeat(1, h, w, 1) # [f, h, w, 3]
-                wasd_action_tensor = rearrange(
-                    wasd_action_tensor,
-                    'f (h c1) (w c2) c -> (f h w) (c c1 c2)',
-                    c1=int(h // lat_h),
-                    c2=int(w // lat_w),
+            # Camera conditioning (only if this user has an action path).
+            ap = action_paths[ui]
+            if ap is not None:
+                c2ws_ui = np.load(os.path.join(ap, "poses.npy"))[:F]
+                Ks_ui = torch.from_numpy(np.load(
+                    os.path.join(ap, "intrinsics.npy"))).float()
+                Ks_ui = get_Ks_transformed(Ks_ui,
+                                            height_org=480, width_org=832,
+                                            height_resize=h, width_resize=w,
+                                            height_final=h, width_final=w)[0]
+                len_c2ws_ = int((len(c2ws_ui) - 1) // 4) + 1
+                len_c2ws_ = int(len_c2ws_ - (len_c2ws_ % chunk_size))
+                c2ws_infer = interpolate_camera_poses(
+                    src_indices=np.linspace(0, len(c2ws_ui) - 1, len(c2ws_ui)),
+                    src_rot_mat=c2ws_ui[:, :3, :3],
+                    src_trans_vec=c2ws_ui[:, :3, 3],
+                    tgt_indices=np.linspace(0, len(c2ws_ui) - 1, len_c2ws_),
                 )
-                wasd_action_tensor = wasd_action_tensor[None, ...] # [b, f*h*w, c]
-                wasd_action_tensor = rearrange(wasd_action_tensor, 'b (f h w) c -> b c f h w', f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
-                c2ws_plucker_emb = torch.cat([c2ws_plucker_emb, wasd_action_tensor], dim=1)
+                c2ws_infer = compute_relative_poses(c2ws_infer, framewise=True)
+                Ks_ui = Ks_ui.repeat(len(c2ws_infer), 1)
+                c2ws_infer = c2ws_infer.to(self.device)
+                Ks_ui = Ks_ui.to(self.device)
+                if self.control_type == 'act':
+                    wasd_ui = np.load(os.path.join(ap, "action.npy"))[:F]
+                    wasd_ui = torch.from_numpy(wasd_ui[::4]).float().to(self.device)
+                else:
+                    wasd_ui = None
+                only_rays_d = wasd_ui is not None
+                cam_emb_ui = get_plucker_embeddings(
+                    c2ws_infer, Ks_ui, h, w, only_rays_d=only_rays_d)
+                cam_emb_ui = rearrange(
+                    cam_emb_ui,
+                    'f (h c1) (w c2) c -> (f h w) (c c1 c2)',
+                    c1=int(h // lat_h), c2=int(w // lat_w))[None]  # [1, fhw, C]
+                cam_emb_ui = rearrange(
+                    cam_emb_ui, 'b (f h w) c -> b c f h w',
+                    f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
+                if wasd_ui is not None:
+                    wasd_t = wasd_ui[:, None, None, :].repeat(1, h, w, 1)
+                    wasd_t = rearrange(
+                        wasd_t,
+                        'f (h c1) (w c2) c -> (f h w) (c c1 c2)',
+                        c1=int(h // lat_h), c2=int(w // lat_w))[None]
+                    wasd_t = rearrange(
+                        wasd_t, 'b (f h w) c -> b c f h w',
+                        f=lat_f, h=lat_h, w=lat_w).to(self.param_dtype)
+                    cam_emb_ui = torch.cat([cam_emb_ui, wasd_t], dim=1)
+                per_user_c2ws.append(cam_emb_ui)
+            else:
+                per_user_c2ws.append(None)
 
-        y = self.vae.encode([
-            torch.concat([
-                torch.nn.functional.interpolate(
-                    img[None].cpu(), size=(h, w), mode='bicubic').transpose(
-                        0, 1),
-                torch.zeros(3, F - 1, h, w)
-            ],
-                         dim=1).to(self.device)
-        ])[0]
-        y = torch.concat([msk, y])
+        # ── 4. Stack per-user tensors into B=N batched form for the chunk
+        # loop. At B=1 these reduce to one-element stacks (functionally
+        # the same as the pre-refactor scalar code).
+        noise_batched = torch.stack(per_user_noise, dim=0)        # [B, 16, lat_f, lat_h, lat_w]
+        y_batched = torch.stack(per_user_y, dim=0)                 # [B, 20, F, lat_h, lat_w]
+        has_cam = per_user_c2ws[0] is not None
+        if has_cam:
+            assert all(c is not None for c in per_user_c2ws), \
+                "Mixed action_path=None and not-None across batch is not supported"
+            c2ws_batched = torch.cat(per_user_c2ws, dim=0)          # [B, C, F, lat_h, lat_w]
 
         @contextmanager
         def noop_no_sync():
             yield
-
         no_sync_model = getattr(self.model, 'no_sync', noop_no_sync)
 
-        # Initialize KV cache to all zeros
+        # KV cache shapes at batch_size = B.
         model_args = self.model.config
         transformer_dtype = self.pipe_dtype
-        frame_seqlen = int(noise.shape[-2] * noise.shape[-1]// 4)
+        frame_seqlen = int(noise_batched.shape[-2] * noise_batched.shape[-1] // 4)
         if self.local_attn_size > -1:
             kv_size = frame_seqlen * self.local_attn_size
         else:
             kv_size = frame_seqlen * lat_f
         head_dim = model_args.dim // model_args.num_heads
         local_num_heads = model_args.num_heads // self.sp_size
-        self_kv_shape = [batch_size, kv_size, local_num_heads, head_dim]
-        self_kv_cache = self._initialize_self_kv_cache(num_layers=model_args.num_layers,
-                                                      shape=self_kv_shape,
-                                                      dtype=transformer_dtype,
-                                                      device=self.device)
-        cross_kv_shape = [batch_size, max_sequence_length, model_args.num_heads, head_dim]
-        cross_kv_cache = self._initialize_crossattn_cache(num_layers=model_args.num_layers,
-                                                         shape=cross_kv_shape,
-                                                         dtype=transformer_dtype,
-                                                         device=self.device)
-        # evaluation mode
-        with (
-                torch.amp.autocast('cuda', dtype=self.param_dtype),
-                torch.no_grad(),
-                no_sync_model(),
-        ):
-            # sample videos
-            latent = noise
-            latents_chunk = latent.split(chunk_size, dim=1) # [c, f, h, w]
-            condition_chunk = y.split(chunk_size, dim=1)
-            c2ws_plucker_emb_chunk = c2ws_plucker_emb.split(chunk_size, dim=2)
+        self_kv_cache = self._initialize_self_kv_cache(
+            num_layers=model_args.num_layers,
+            shape=[batch_size, kv_size, local_num_heads, head_dim],
+            dtype=transformer_dtype, device=self.device)
+        cross_kv_cache = self._initialize_crossattn_cache(
+            num_layers=model_args.num_layers,
+            shape=[batch_size, max_sequence_length, model_args.num_heads, head_dim],
+            dtype=transformer_dtype, device=self.device)
+
+        # ── 5. Chunk loop with batched inputs. Same structure as before
+        # but every per-step tensor carries the batch dim.
+        with (torch.amp.autocast('cuda', dtype=self.param_dtype),
+              torch.no_grad(),
+              no_sync_model()):
+            # Split along the FRAME dim (dim=2 now that batch is dim=0).
+            latents_chunk = noise_batched.split(chunk_size, dim=2)
+            condition_chunk = y_batched.split(chunk_size, dim=2)
+            if has_cam:
+                c2ws_chunk = c2ws_batched.split(chunk_size, dim=2)
             num_inference_chunk = len(latents_chunk)
             pred_latent_chunks = []
             for chunk_id in tqdm(range(num_inference_chunk)):
-                current_latent = latents_chunk[chunk_id]
-                current_condition = condition_chunk[chunk_id]
-                current_c2ws_plucker_emb = c2ws_plucker_emb_chunk[chunk_id]
+                current_latent = latents_chunk[chunk_id]        # [B, 16, csz, h, w]
+                current_condition = condition_chunk[chunk_id]    # [B, 20, csz, h, w]
 
-                dit_cond_dict = {
-                    "c2ws_plucker_emb": current_c2ws_plucker_emb.chunk(1, dim=0),
-                }
+                if has_cam:
+                    c_chunk = c2ws_chunk[chunk_id]               # [B, C, csz, h, w]
+                    # The block expects a tuple of per-batch tensors.
+                    dit_cond_dict = {
+                        "c2ws_plucker_emb":
+                            tuple(c_chunk[bi:bi+1] for bi in range(batch_size)),
+                    }
+                else:
+                    dit_cond_dict = None
 
                 current_start_int = chunk_id * chunk_size * frame_seqlen
                 current_end_int = current_start_int + chunk_size * frame_seqlen
-                # Pre-built KV-write index. Shape [seq_lens] is fixed; only
-                # the contents shift per chunk. Lets the inner attention
-                # forward use index_copy_ instead of Python-int slice
-                # indexing, which is the gate to torch.compile / CUDA Graphs.
                 kv_write_index = torch.arange(
                     current_start_int, current_end_int,
                     device=self.device, dtype=torch.long)
                 kwargs = {
-                    'context': [context[0]],
+                    'context': per_user_context,
                     'seq_len': max_seq_len,
-                    'y': [current_condition],
+                    'y': [current_condition[bi] for bi in range(batch_size)],
                     'dit_cond_dict': dit_cond_dict,
                     'kv_cache': self_kv_cache,
                     'crossattn_cache': cross_kv_cache,
@@ -640,61 +665,85 @@ class WanI2VFast:
                     torch.cuda.empty_cache()
 
                 for timestep_idx in range(len(timesteps)):
-                    latent_model_input = [current_latent.to(self.device)]
-                    current_timestep = [timesteps[timestep_idx]]
+                    latent_input_list = [
+                        current_latent[bi].to(self.device)
+                        for bi in range(batch_size)
+                    ]
+                    # Timestep tensor must have batch dim B (one per user;
+                    # all the same value for homogeneous batching).
+                    timestep = timesteps[timestep_idx].repeat(batch_size).to(self.device)
 
-                    timestep = torch.stack(current_timestep).to(self.device)
-
-                    noise_pred = self.model(
-                        x=latent_model_input, t=timestep,
+                    noise_pred_list = self.model(
+                        x=latent_input_list, t=timestep,
                         cross_attn_first_call=not self._cross_attn_initialized,
-                        **kwargs)[0]
+                        **kwargs)
                     self._cross_attn_initialized = True
+                    # Stack list of [16, csz, h, w] → [B, 16, csz, h, w]
+                    noise_pred = torch.stack(noise_pred_list, dim=0)
 
                     if offload_model:
                         torch.cuda.empty_cache()
 
-                    x0 = self._convert_flow_pred_to_x0(
-                        flow_pred=noise_pred,
-                        xt=current_latent,
-                        timestep=current_timestep[0],
-                        scheduler=self.scheduler,
-                    )
+                    # x0 per user (scheduler ops are elementwise → batch-safe).
+                    x0_list = [
+                        self._convert_flow_pred_to_x0(
+                            flow_pred=noise_pred[bi],
+                            xt=current_latent[bi],
+                            timestep=timesteps[timestep_idx],
+                            scheduler=self.scheduler,
+                        )
+                        for bi in range(batch_size)
+                    ]
+                    x0 = torch.stack(x0_list, dim=0)               # [B, 16, csz, h, w]
 
                     if timestep_idx < len(timesteps) - 1:
                         next_timestep = timesteps[timestep_idx + 1]
-                        current_latent = self.scheduler.add_noise(x0, torch.randn(x0.shape, generator=seed_g, device=x0.device, dtype=x0.dtype), next_timestep)
+                        # Per-user seeded noise — preserves RNG stream
+                        # ordering token-for-token vs the single-user path
+                        # at B=1.
+                        step_noise = torch.stack([
+                            torch.randn(x0[bi].shape, generator=seed_gens[bi],
+                                        device=x0.device, dtype=x0.dtype)
+                            for bi in range(batch_size)
+                        ], dim=0)
+                        current_latent = self.scheduler.add_noise(
+                            x0, step_noise, next_timestep)
                     else:
-                        # note return x0
                         break
 
                 pred_latent_chunks.append(x0)
 
-                # Update kv cache
-                context_timestep = [timesteps[-1] * 0.0]
-                timestep = torch.stack(context_timestep).to(self.device)
-                self.model(x=[x0], t=timestep,
-                           cross_attn_first_call=False,
-                           **kwargs)
+                # KV cache update forward (t=0).
+                timestep = (timesteps[-1] * 0.0).repeat(batch_size).to(self.device)
+                self.model(
+                    x=[x0[bi] for bi in range(batch_size)],
+                    t=timestep, cross_attn_first_call=False, **kwargs)
 
-            pred_latent_chunks = torch.cat(pred_latent_chunks, dim=1)
+            # Concatenate chunks along the FRAME dim (dim=2 for batched).
+            pred_latent_full = torch.cat(pred_latent_chunks, dim=2)    # [B, 16, F, h, w]
 
             if offload_model:
                 self.model.cpu()
                 torch.cuda.empty_cache()
 
+            # ── 6. Per-user VAE decode on rank-0. VAE is causal-temporal
+            # internally; decode users sequentially (E4 is the parallel
+            # decode follow-up).
             if self.rank == 0:
-                videos = self.vae.decode([pred_latent_chunks])
+                videos = [self.vae.decode([pred_latent_full[bi]])[0]
+                          for bi in range(batch_size)]
 
-        # del noise, latent, x0
-        # del sample_scheduler
         if offload_model:
             gc.collect()
             torch.cuda.synchronize()
         if dist.is_initialized():
             dist.barrier()
 
-        return videos[0] if self.rank == 0 else None
+        if self.rank != 0:
+            return None
+        if was_scalar_input:
+            return videos[0]
+        return videos
 
     def _initialize_self_kv_cache(self, num_layers, shape, dtype, device):
         """
